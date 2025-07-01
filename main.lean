@@ -20,9 +20,6 @@ def FormIdent := String
 @[reducible]
 def TermIdent := String
 
-@[reducible]
-def ConIdent := String
-
 inductive Form
 | var: FormIdent → Form
 | con: FormIdent → Form
@@ -32,7 +29,7 @@ deriving BEq
 def Form.toString
 : Form → String
 | var a => a
-| con c => c
+| con a => a
 | to φ χ => s!"({φ.toString} > {χ.toString})"
 
 instance: ToString Form where
@@ -49,40 +46,46 @@ partial def Form.free (φ: Form): List FormIdent :=
 def Form.rename (map: Std.HashMap FormIdent FormIdent)
 : Form → Form
 | Form.var a => Form.var (map.getD a a)
-| Form.con c => Form.con c
+| Form.con x => Form.con x
 | Form.to φ χ => (rename map φ).to (rename map χ)
 
 inductive Pattern
 | var: TermIdent → Pattern
-| con: ConIdent → Pattern
-| conApp: ConIdent → Pattern → Pattern
+| con: TermIdent → Pattern
+| conApp: TermIdent → Pattern → Pattern
 
 def Pattern.toString: Pattern → String
 | Pattern.var x => x
-| Pattern.con c => c
-| Pattern.conApp c p => s!"{c} {p.toString}"
+| Pattern.con x => x
+| Pattern.conApp x p => s!"{x} {p.toString}"
 
 instance: ToString Pattern where
   toString := Pattern.toString
 
+def Pattern.occur: Pattern → TermIdent → Bool
+| Pattern.var x, y => x == y
+| Pattern.con _, _ => false
+| Pattern.conApp _ p, x => p.occur x
+
 inductive Term
 | ann: Term → Form → Term
 | var: TermIdent → Term
-| con: ConIdent → Term
+| con: TermIdent → Term
 | abs: TermIdent → Option Form → Term → Term
 | app: Term → Term → Term
-| fix: TermIdent → TermIdent → Term → Term
+| fix: TermIdent → TermIdent → Option Form → Term → Term
 | mat: Term → List (Pattern × Term) → Term
 
 partial def Term.toString
 : Term → String
 | Term.ann t φ => s!"({t.toString}: {φ.toString})"
 | Term.var a => a
-| Term.con c => c
+| Term.con x => x
 | Term.abs x none t => s!"({x} ↦ {t.toString})"
-| Term.abs x (some φ) t => s!"({x}: {φ.toString} ↦ {t.toString})"
+| Term.abs x (some φ) t => s!"({x}: {φ} ↦ {t.toString})"
 | Term.app t u => s!"({t.toString} {u.toString})"
-| Term.fix r x t => s!"(fix {r} {x} ↦ {t.toString})"
+| Term.fix r x none t => s!"(fix {r} {x} ↦ {t.toString})"
+| Term.fix r x (some φ) t => s!"(fix {r} {x}: {φ} ↦ {t.toString})"
 | Term.mat t alts =>
   s!"({t.toString} " ++
   " ".intercalate (alts.map fun (p, u) => s!"| {p.toString}, {u.toString}") ++
@@ -91,17 +94,35 @@ partial def Term.toString
 instance: ToString Term where
   toString := Term.toString
 
+partial def Term.free: Term → TermIdent → Bool
+| ann t _, x => t.free x
+| var x, y => x == y
+| con _, _ => false
+| abs x _ t, y => x != y && t.free y
+| app t u, x => t.free x || u.free x
+| fix f x _ t, y => x != y && f != y && t.free y
+| mat t alts, x => t.free x || alts.any fun (p, u) =>
+  (p.occur x).not && u.free x
+
+def Term.absPlu: List (TermIdent × Option Form) → Term → Term
+| [], t => t
+| (x, φ) :: xs, t => Term.abs x φ $ Term.absPlu xs t
+
+def Term.appPlu: Term → List Term → Term
+| t, [] => t
+| t, u :: us => (t.app u).appPlu us
+
 structure Env where
-  cons: Std.HashMap ConIdent Form
+  cons: Std.HashMap TermIdent Form
   vars: Std.HashMap TermIdent Form
   subs: Std.HashMap FormIdent Form
 deriving BEq
 
-def Form.occur (a: FormIdent)
-: Form → Bool
-| var b => a == b
-| con _ => false
-| to φ χ => occur a φ || occur a χ
+def Form.occur
+: Form → FormIdent → Bool
+| var a, b => a == b
+| con _, _ => false
+| to φ χ, a => φ.occur a || χ.occur a
 
 partial def Env.fresh (env: Env): String :=
   let rec go (n: Nat) :=
@@ -116,7 +137,7 @@ partial def Env.fresh (env: Env): String :=
 def Env.substituteOnce (env: Env)
 : Form → Form
 | Form.var a => env.subs.getD a (Form.var a)
-| Form.con c => Form.con c
+| Form.con x => Form.con x
 | Form.to φ χ => (env.substituteOnce φ).to (env.substituteOnce χ)
 
 partial def Env.substitute (env: Env) (φ: Form): Form :=
@@ -125,16 +146,16 @@ partial def Env.substitute (env: Env) (φ: Form): Form :=
 
 partial def Env.unify (env: Env)
 : Form → Form → String ⊕ Env
-| Form.con c, Form.con c' =>
-  if c = c'
+| Form.con a, Form.con a' =>
+  if a = a'
     then pure env
-    else Sum.inl s!"unify: con: {c} is not {c'}"
+    else Sum.inl s!"unify: con: {a} is not {a'}"
 | Form.var a, Form.var a' =>
   if a = a'
     then pure env
     else pure {env with subs := env.subs.insert a' (Form.var a)}
 | Form.var a, φ =>
-  if Form.occur a φ
+  if φ.occur a
     then Sum.inl s!"unify: {a} occureth in {φ}"
     else
       match env.subs.get? a with
@@ -149,13 +170,13 @@ partial def Env.unify (env: Env)
 def Env.checkPattern (env: Env)
 : Pattern → Form → String ⊕ Env
 | Pattern.var x, φ => pure { env with vars := env.vars.insert x φ}
-| Pattern.con c, φ =>
-  match env.cons.get? c with
-  | none => Sum.inl s!"checkPattern: con: i know not {c}"
+| Pattern.con x, φ =>
+  match env.cons.get? x with
+  | none => Sum.inl s!"checkPattern: con: i know not {x}"
   | some φ' => env.unify φ φ'
-| Pattern.conApp c p, φ =>
-  match env.cons.get? c with
-  | none => Sum.inl s!"checkPattern: conApp: i know not {c}"
+| Pattern.conApp a p, φ =>
+  match env.cons.get? a with
+  | none => Sum.inl s!"checkPattern: conApp: i know not {a}"
   | some (Form.to χ φ') => do
     let env' ← env.unify φ φ'
     env'.checkPattern p χ
@@ -176,29 +197,31 @@ mutual
   | Term.var x => match env.vars.get? x with
     | some φ => pure (φ, env)
     | none => Sum.inl s!"infer: var: i know not {x}"
-  | Term.con c => match env.cons.get? c with
+  | Term.con x => match env.cons.get? x with
     | some φ => pure (φ, env)
-    | none => Sum.inl s!"infer: con: i know not {c}"
-  | Term.abs x none t => do
-    let φ := env.vars.getD x (Form.var (env.fresh))
+    | none => Sum.inl s!"infer: con: i know not {x}"
+  | Term.abs x φ t => do
+    let φ := φ.getD (Form.var (env.fresh))
     let (φ_t, env_t) ← {env with vars := env.vars.insert x φ}.infer t
     pure (env_t.substitute φ |>.to φ_t, env_t)
-  | Term.abs x (some φ) t => do
-    let (φ_t, env_t) ← {env with vars := env.vars.insert x φ}.infer t
-    pure (φ.to φ_t, env_t)
   | Term.app t u => do
     let (φ_t, env_t) ← env.infer t
     match φ_t with
     | Form.to φ0 φ1 => Prod.mk φ1 <$> env_t.check u φ0
     | _ => Sum.inl s!"infer: app: {φ_t} is not type of function"
-  | Term.fix r x t => do
-      let a := env.fresh
-      let b := {env with subs := env.subs.insert a (Form.var "temp")}.fresh
-      let φ_r := Form.to (Form.var a) (Form.var b)
-      let env_r := {env with vars := env.vars.insert x (Form.var a) |>.insert r φ_r}
-      let (φ_t, env_t) ← env_r.infer t
-      let env_unify ← env_t.unify (Form.var b) φ_t
-      pure (env_unify.substitute φ_r, env_unify)
+  | Term.fix f x φ t => do
+    let (φ, χ) :=
+      match φ with
+      | none =>
+        let a := env.fresh
+        let b := {env with subs := env.subs.insert a (Form.var "temp")}.fresh
+        (Form.var a, Form.var b)
+      | some φ => (φ, Form.var (env.fresh))
+    let φ_f := φ.to χ
+    let env_f := {env with vars := env.vars.insert x φ |>.insert f φ_f}
+    let (φ_t, env_t) ← env_f.infer t
+    let env_unify ← env_t.unify χ φ_t
+    pure (env_unify.substitute φ_f, env_unify)
   | Term.mat t alts => do
     let (φ_t, env_t) ← env.infer t
     match alts with
@@ -222,26 +245,26 @@ def Terms := Std.HashMap String Term
 def Term.destruct (terms: Terms)
 : Pattern → Term → String ⊕ Terms
 | Pattern.var x, t => pure (terms.insert x t)
-| Pattern.con c, Term.con c' => if c == c'
+| Pattern.con x, Term.con x' => if x == x'
   then pure terms
-  else Sum.inl s!"destruct: con: {c} is not {c'}"
-| Pattern.conApp c p, Term.app (Term.con c') t => if c == c'
+  else Sum.inl s!"destruct: con: {x} is not {x'}"
+| Pattern.conApp x p, Term.app (Term.con x') t => if x == x'
   then Term.destruct terms p t
-  else Sum.inl s!"destruct: app: {c} is not {c'}"
+  else Sum.inl s!"destruct: app: {x} is not {x'}"
 | p, t => Sum.inl s!"destruct: default: {p} is not {t}"
 
 partial def Term.reduce (terms: Terms): Term → Term
 | ann t _ => reduce terms t
 | var x => terms.getD x (var x)
-| con c => con c
+| con x => con x
 | abs x φ t => abs x φ (reduce (terms.erase x) t)
-| fix r x t => fix r x (reduce (terms.erase x) t)
+| fix r x φ t => fix r x φ (reduce (terms.erase x) t)
 | app t u =>
   let t' := reduce terms t
   let u' := reduce terms u
   match t' with
   | abs x _ t'' => reduce (terms.insert x u') t''
-  | fix r x t'' =>
+  | fix r x _ t'' =>
     let terms' := terms.insert x u' |>.insert r t'
     reduce terms' t''
   | _ => app t' u'
@@ -256,7 +279,8 @@ partial def Term.reduce (terms: Terms): Term → Term
   | (u, terms') :: _ => reduce terms' u
 
 inductive Decl
-| alias: TermIdent → Option Form → Term → Decl
+| name: TermIdent → List (TermIdent × Option Form) → (Option Form) → Term → Decl
+| fix: TermIdent → TermIdent → Term → Decl
 | data: String → List (String × List Form) → Decl
 
 def toPlu: List Form → Form → Form
@@ -270,7 +294,11 @@ def Form.minimise (φ: Form): Form :=
     ) (Std.HashMap.emptyWithCapacity, 0)
   φ.rename map
 
-def Env.interpret
+def Form.result: Form → Form
+| to _ χ => χ.result
+| it => it
+
+partial def Env.interpret
   (env: Env)
   (terms: Terms)
 : List Decl → String ⊕ Term × Form × List (String × Form)
@@ -281,17 +309,37 @@ def Env.interpret
     pure (
       Term.reduce terms t,
       env.substitute φ,
-      terms.toList.map fun (x, t) =>
+      terms.toList.map fun (x, _) =>
         (x, env.vars.getD x (Form.var "unknown"))
     )
-| Decl.alias x none t :: decls => do
-  let (φ, env_t) ← env.infer t
-  {env_t with vars :=
-    env.vars.insert x (env_t.substitute φ |>.minimise)
-  }.interpret (terms.insert x t) decls
-| Decl.alias x (some φ) t :: decls => do
-  let env' ← env.check t φ
-  {env' with vars := env'.vars.insert x φ}.interpret terms decls
+| Decl.name f xs χ t :: decls => do
+  let idents := f :: xs.map fun (x, _) => x
+  if idents.any fun ident => (idents.erase ident).contains ident
+    then Sum.inl s!"interpret: name: duplicate identifiers {idents}"
+    else
+
+    if t.free f
+      then match xs with
+      | [] => Sum.inl s!"interpret: name: recursive without parameter {f}"
+      | (x, _) :: xs' =>
+        let t' := match χ with
+        | none => Term.fix f x none (Term.absPlu xs' t)
+        | some χ => Term.fix f x none (Term.absPlu xs' (Term.ann t χ))
+        let (φ, env') ← env.infer t'
+        {env' with vars := env'.vars.insert f φ}.interpret
+          (terms.insert f t')
+          decls
+      else
+        let t' := Term.absPlu xs $
+          match χ with
+          | none => t
+          | some χ => Term.ann t χ
+        let (φ, env') ← env.infer t'
+        {env' with vars := env'.vars.insert f φ}.interpret
+          (terms.insert f t')
+          decls
+| Decl.fix r x t :: decls =>
+  env.interpret terms $ Decl.name r [] none (Term.fix r x none t) :: decls
 | Decl.data a cs :: decls =>
   {env with
     cons :=
@@ -299,10 +347,6 @@ def Env.interpret
   }.interpret
     terms
     decls
-
-def Term.appPlu: Term → List Term → Term
-| t, [] => t
-| t, u :: us => (t.app u).appPlu us
 
 #eval ({
   cons := Std.HashMap.emptyWithCapacity,
@@ -319,40 +363,36 @@ def Term.appPlu: Term → List Term → Term
     Decl.data "'nat" [
       ("zero", []),
       ("succ", [Form.var "nat"])],
-    Decl.alias "id" none $
-      Term.abs "x" none (Term.var "x"),
-    Decl.alias "const" none $
-      Term.abs "x" none $
-      Term.abs "y" none (Term.var "x"),
-    Decl.alias "not" none $
-      Term.abs "x" none $
+    Decl.name "id" [("x", none)] none $ Term.var "x",
+    Decl.name "const" [("x", none), ("y", none)] none $ (Term.var "x"),
+    Decl.name "not" [("x", none)] none $
       Term.mat (Term.var "x") [
         (Pattern.con "true", Term.con "false"),
         (Pattern.con "false", Term.con "true"),
       ],
-    Decl.alias "if" none $
-      Term.abs "x" none $
-      Term.abs "then" none $
-      Term.abs "else" none $
+    Decl.name "if" [
+      ("x", none),
+      ("then", none),
+      ("else", none),
+    ] none $
       Term.mat (Term.var "x") [
         (Pattern.con "true", Term.var "then"),
         (Pattern.con "false", Term.var "else"),
       ],
-    Decl.alias "even" none $
-      Term.fix "even" "x" $
+    Decl.name "even" [("x", none)] none $
       Term.mat (Term.var "x") [
         (Pattern.con "zero",
           Term.con "true"),
         (Pattern.conApp "succ" (Pattern.var "x_"),
           (Term.var "not").app ((Term.var "even").app (Term.var "x_")))
       ],
-    Decl.alias "zero_is_even" none $
+    Decl.name "zero_is_even" [] none $
       Term.app (Term.var "even") (Term.con "zero"),
-    Decl.alias "one_is_even" none $
+    Decl.name "one_is_even" [] none $
       Term.app (Term.var "even") (Term.app (Term.con "succ") (Term.con "zero")),
-    Decl.alias "main" none $
+    Decl.name "main" [] none $
       Term.appPlu (Term.var "if") [
-        Term.con "true",
+        Term.con "false",
         Term.con "zero",
         Term.app (Term.con "succ") (Term.con "zero")
       ]
